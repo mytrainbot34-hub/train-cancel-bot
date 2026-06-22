@@ -1,0 +1,8 @@
+ - name: Run bot
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          TRANSPORTAPI_APP_ID: ${{ secrets.TRANSPORTAPI_APP_ID }}
+          TRANSPORTAPI_APP_KEY: ${{ secrets.TRANSPORTAPI_APP_KEY }}
+        run: python train_cancel_bot.py
