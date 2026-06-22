@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Train Cancellation Bot
-Monitors trains from Manchester Airport (MIA) to Barrow-in-Furness (BIF)
-Mon-Fri, 06:00-16:00. Sends an email when a cancellation is detected.
+Train Cancellation Bot – GitHub Actions version (using Transport API)
+Reads credentials from environment variables.
 """
 
 import json
@@ -18,127 +17,108 @@ import requests
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
-# Monitoring settings
 ORIGIN = "MIA"               # Manchester Airport
 DESTINATION = "BIF"          # Barrow-in-Furness
-START_TIME = time(6, 0)      # 06:00
-END_TIME = time(16, 0)       # 16:00 (departures *before* this time)
-WEEKDAYS_ONLY = True         # Only run Monday-Friday
+START_TIME = time(6, 0)
+END_TIME = time(16, 0)
 
-# How many minutes ahead the bot looks from the start time (should cover 10h)
-TIME_WINDOW_MINUTES = 600    # 6:00 -> 16:00 = 600 minutes
+# Transport API settings
+TRANSPORTAPI_BASE = "https://transportapi.com/v3/uk"
+APP_ID = os.environ.get("TRANSPORTAPI_APP_ID")
+APP_KEY = os.environ.get("TRANSPORTAPI_APP_KEY")
 
-# Huxley endpoint (no API key required)
-HUXLEY_URL = "https://huxley.apphb.com/departures/{crs}/from"
-
-# File to remember already notified cancellations (prevents duplicates)
+# Persistent file
 NOTIFIED_FILE = Path("notified_cancellations.json")
 
-# Email settings (replace with your own)
+# Email credentials
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
+RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
+
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "mytrainbot34@gmail.com"
-SENDER_PASSWORD = "Tolstoy94!"   # Use an App Password if 2FA is on
-RECIPIENT_EMAIL = "upcottconnor@gmail.com"
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("train_bot")
 
-# ----------------------------------------------------------------------
-# Helper functions
-# ----------------------------------------------------------------------
-def is_weekday() -> bool:
-    """Return True if today is Monday-Friday."""
-    return datetime.now().weekday() < 5  # 0=Mon, 6=Sun
+
+def is_weekday():
+    return datetime.now().weekday() < 5
 
 
-def fetch_departures(origin: str, start: time, window_min: int) -> list:
+def fetch_departures(origin, destination):
     """
-    Fetch all departures from `origin` station starting at `start` time,
-    looking `window_min` minutes ahead.
-    Returns a list of service dicts.
+    Fetch live departures from `origin` station.
+    Transport API returns a list of ALL departures – we filter later.
     """
-    time_str = start.strftime("%H:%M")
-    url = HUXLEY_URL.format(crs=origin)
-    params = {"time": time_str, "timeWindow": window_min}
-    log.info("Requesting departures: %s %s", url, params)
+    if not APP_ID or not APP_KEY:
+        log.error("Missing Transport API credentials")
+        return []
 
+    url = f"{TRANSPORTAPI_BASE}/train/station/{origin}/live.json"
+    params = {
+        "app_id": APP_ID,
+        "app_key": APP_KEY,
+        "calling_at": destination,      # filter to trains calling at Barrow
+        "darwin": "true",               # include cancellation data
+        "train_status": "all",          # include cancelled trains
+    }
+
+    log.info("Requesting departures from %s calling at %s", origin, destination)
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-    except Exception as exc:
-        log.error("Failed to fetch departures: %s", exc)
+    except Exception as e:
+        log.error("Failed to fetch departures: %s", e)
         return []
 
-    # The API returns a dict with "trainServices" (may be None)
-    services = data.get("trainServices")
-    if not services:
-        log.info("No train services found in the requested window.")
-        return []
-    return services
+    # Transport API structure: {"departures": {"all": [...]}}
+    departures = data.get("departures", {}).get("all", [])
+    if not departures:
+        log.info("No departures returned from Transport API.")
+    return departures
 
 
-def filter_services(services: list, destination_crs: str,
-                    end_time: time) -> list:
-    """Keep only services heading to `destination_crs` and departing before `end_time`."""
+def filter_services(services, end_time):
+    """
+    Keep services:
+    - scheduled departure >= START_TIME (implicitly by the request time)
+    - scheduled departure < end_time
+    - not a bus replacement (optional)
+    """
     filtered = []
     for svc in services:
-        # Destination check
-        dest = svc.get("destination", [{}])[0] if isinstance(svc.get("destination"), list) else svc.get("destination", {})
-        if dest.get("crs") != destination_crs:
-            continue
-
-        # Scheduled departure time check
-        std_str = svc.get("std")
-        if not std_str:
+        # Scheduled departure time
+        aimed = svc.get("aimed_departure_time")  # e.g., "07:30"
+        if not aimed:
             continue
         try:
-            dep_time = datetime.strptime(std_str, "%H:%M").time()
+            dep_time = datetime.strptime(aimed, "%H:%M").time()
         except ValueError:
-            log.warning("Could not parse std '%s'", std_str)
             continue
-        if dep_time >= end_time:
+        if dep_time < START_TIME or dep_time >= end_time:
             continue
 
         filtered.append(svc)
     return filtered
 
 
-def find_new_cancellations(services: list, notified_ids: set) -> list:
-    """Return services that are cancelled and not yet notified."""
-    new = []
-    for svc in services:
-        if svc.get("isCancelled"):
-            sid = svc.get("serviceID")
-            if not sid:
-                continue
-            key = f"{sid}_{datetime.now().strftime('%Y%m%d')}"
-            if key not in notified_ids:
-                new.append(svc)
-                notified_ids.add(key)   # mark as seen immediately
-    return new
-
-
-def load_notified_ids(filepath: Path) -> set:
-    """Load previously notified service IDs from a JSON file."""
+def load_notified_ids(filepath):
     if not filepath.exists():
         return set()
     try:
         with open(filepath, "r") as f:
-            data = json.load(f)
-        return set(data.get("ids", []))
+            return set(json.load(f).get("ids", []))
     except Exception:
         log.exception("Could not read notified file, starting fresh.")
         return set()
 
 
-def save_notified_ids(filepath: Path, ids: set) -> None:
-    """Save notified service IDs to a JSON file."""
+def save_notified_ids(filepath, ids):
     try:
         with open(filepath, "w") as f:
             json.dump({"ids": sorted(ids)}, f, indent=2)
@@ -146,66 +126,66 @@ def save_notified_ids(filepath: Path, ids: set) -> None:
         log.exception("Failed to write notified file.")
 
 
-def send_email(subject: str, body: str) -> None:
-    """Send an email notification."""
+def send_email(subject, body):
+    if not SENDER_EMAIL or not SENDER_PASSWORD:
+        log.error("Missing email credentials")
+        return
     msg = EmailMessage()
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECIPIENT_EMAIL
     msg["Subject"] = subject
     msg.set_content(body)
-
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.send_message(msg)
-        log.info("Email sent to %s", RECIPIENT_EMAIL)
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as srv:
+            srv.starttls()
+            srv.login(SENDER_EMAIL, SENDER_PASSWORD)
+            srv.send_message(msg)
+        log.info("Email sent.")
     except Exception:
-        log.exception("Failed to send email.")
+        log.exception("Email failed.")
 
 
-# ----------------------------------------------------------------------
-# Main monitoring routine
-# ----------------------------------------------------------------------
 def main():
-    # Only run on weekdays if configured
-    if WEEKDAYS_ONLY and not is_weekday():
-        log.info("Today is not a weekday – exiting.")
+    if not is_weekday():
+        log.info("Not a weekday – exiting.")
         return
 
-    # Load known cancellations
     notified = load_notified_ids(NOTIFIED_FILE)
-
-    # 1. Get all departures from Manchester Airport in the monitoring window
-    services = fetch_departures(ORIGIN, START_TIME, TIME_WINDOW_MINUTES)
-
-    # 2. Filter to Barrow-in-Furness only, and departure before END_TIME
-    targeted = filter_services(services, DESTINATION, END_TIME)
+    raw_services = fetch_departures(ORIGIN, DESTINATION)
+    targeted = filter_services(raw_services, END_TIME)
     log.info("Found %d trains to %s in the time window.", len(targeted), DESTINATION)
 
-    # 3. Find any cancellations we haven't alerted about yet
-    cancellations = find_new_cancellations(targeted, notified)
+    new_cancelled = []
+    for svc in targeted:
+        # Transport API indicates cancellation via "status" field
+        if svc.get("status") == "CANCELLED":
+            # Unique ID: combine service identifier and date
+            uid = svc.get("service_uid", "unknown")  # unique per train service
+            train_date = svc.get("date", datetime.now().strftime("%Y-%m-%d"))
+            key = f"{uid}_{train_date}"
+            if key not in notified:
+                new_cancelled.append(svc)
+                notified.add(key)
 
-    if not cancellations:
-        log.info("No new cancellations detected.")
+    if not new_cancelled:
+        log.info("No new cancellations.")
     else:
-        log.info("Detected %d new cancellation(s)!", len(cancellations))
-        for svc in cancellations:
-            std = svc.get("std", "??:??")
-            reason = svc.get("cancelReason", "No reason given")
-            dest_name = svc.get("destination", [{}])[0].get("locationName", DESTINATION) if isinstance(svc.get("destination"), list) else svc.get("destination", {}).get("locationName", DESTINATION)
-            subject = f"🚫 TRAIN CANCELLED: {std} MIA → {dest_name}"
+        log.info("Detected %d new cancellation(s).", len(new_cancelled))
+        for svc in new_cancelled:
+            aimed = svc.get("aimed_departure_time", "??:??")
+            reason = svc.get("cancel_reason", "No reason given")
+            destination_name = svc.get("destination_name", DESTINATION)
+            subject = f"🚫 TRAIN CANCELLED: {aimed} MIA → {destination_name}"
             body = (
-                f"Scheduled departure: {std}\n"
-                f"Destination: {dest_name}\n"
+                f"Scheduled departure: {aimed}\n"
+                f"Destination: {destination_name}\n"
                 f"Reason: {reason}\n"
-                f"Service ID: {svc.get('serviceID', 'unknown')}\n"
+                f"Service UID: {svc.get('service_uid', 'unknown')}\n"
                 f"\n-- Train Cancel Bot"
             )
             send_email(subject, body)
 
-        # Persist the updated list of notified IDs
-        save_notified_ids(NOTIFIED_FILE, notified)
+    save_notified_ids(NOTIFIED_FILE, notified)
 
 
 if __name__ == "__main__":
