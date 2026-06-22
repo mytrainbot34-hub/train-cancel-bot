@@ -16,8 +16,8 @@ import requests
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
-# ORIGIN = "MIA"      # Manchester Airport
-# DESTINATION = "BIF"  # Barrow-in-Furness
+ORIGIN = "MIA"               # Manchester Airport
+DESTINATION = "BIF"          # Barrow-in-Furness
 START_TIME = time(6, 0)
 END_TIME = time(16, 0)
 
