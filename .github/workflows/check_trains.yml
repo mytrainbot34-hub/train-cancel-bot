@@ -1,0 +1,47 @@
+name: Train Cancellation Check
+
+on:
+  schedule:
+    # Run every 5 minutes, Monday–Friday (1=Mon, 5=Fri)
+    - cron: '*/5 * * * 1-5'
+  # Allow manual run for testing
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true   # needed to push the updated JSON file
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run bot
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: python train_cancel_bot.py
+
+      - name: Commit updated notification list
+        if: success()   # only commit if the script ran without error
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add notified_cancellations.json
+          # Only commit if there are changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update notified cancellations [skip ci]"
+            git push
+          fi
